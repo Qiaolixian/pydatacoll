@@ -1,10 +1,19 @@
-.. pydatacoll documentation master file, created by
-   sphinx-quickstart on Tue Dec  8 16:19:04 2015.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
 PyDataColl
 ==========
+
+.. image:: https://travis-ci.org/timercrack/pydatacoll.svg
+    :target: https://travis-ci.org/timercrack/pydatacoll?branch=master
+
+.. image:: https://coveralls.io/repos/timercrack/pydatacoll/badge.svg?branch=master&service=github
+    :target: https://coveralls.io/github/timercrack/pydatacoll?branch=master
+
+.. image:: https://readthedocs.org/projects/pydatacoll/badge/?version=latest
+    :target: http://pydatacoll.readthedocs.org/en/latest/?badge=latest
+    :alt: Documentation Status
+
+.. image:: https://badges.gitter.im/timercrack/pydatacoll.svg
+    :alt: Join the chat at https://gitter.im/timercrack/pydatacoll
+    :target: https://gitter.im/timercrack/pydatacoll?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge
 
 PyDataColl is a `SCADA <Ahttps://en.wikipedia.org/wiki/SCADA>`_-like system which use Python as the main language. It
 originally inspired by an old program I made as for a core part of a large
@@ -54,7 +63,7 @@ the following optional packages may be useful:
 .. note::
     to stop server, press CTRL+C to exit
 
-3.  Visit http://localhost:8080 in browser to see the server information, if
+3.  Congratulations! The server is running now. Visit http://localhost:8080 in browser to see the server information, if
     success, you will find something like this::
 
         PyDataColl is running, available API:
@@ -63,8 +72,7 @@ the following optional packages may be useful:
         method: GET      URL: http://localhost:8080/api/v1/devices
         (...more omitted)
 
-4.  Congratulations! The server is running now. You can send request to server with your favorite http client!
-    check :doc:`restapi` to see the API list.
+4.  Now you can send request to server with your favorite http client! check :doc:`restapi` to see the API list.
 
 **Platforms**: PyDataColl should run on any Unix-like platform, although for the best performance and scalability only
 Linux (with ``epoll``) and BSD (with ``kqueue``) are recommended for production deployment (even though Mac OS X is
@@ -77,27 +85,3 @@ Quick links
 
 * `Source (github) <https://github.com/timercrack/pydatacoll>`_
 * `Docs <http://pydatacoll.readthedocs.org/>`_
-
-
-Documentation
--------------
-
-This documentation is also available in `PDF formats
-<https://readthedocs.org/projects/pydatacoll/downloads/>`_.
-
-.. toctree::
-   :maxdepth: 2
-   :titlesonly:
-
-   guide
-   develop
-   restapi
-
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
-

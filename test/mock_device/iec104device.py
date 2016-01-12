@@ -1,12 +1,15 @@
+import random
 import asyncio
 from collections import defaultdict
 from collections import deque
 import redis
 
-from protocols.IEC104.frame import *
-from utils import logger as my_logger
+import pydatacoll.utils.logger as my_logger
+from pydatacoll.protocols.iec104.frame import *
+from pydatacoll.utils import str_to_number
+from pydatacoll.utils.read_config import *
 
-logger = my_logger.getLogger('MockIEC104')
+logger = my_logger.get_logger('MockIEC104')
 
 
 # 模拟104从站，device_id=监听的TCP端口-2403
@@ -14,9 +17,8 @@ class IEC104Device(asyncio.Protocol):
     frame_list = defaultdict(list)
 
     def __init__(self):
-        self.coll_interval = datetime.timedelta(minutes=15)
         self.io_loop = None
-        self.redis = None
+        self.redis = redis.StrictRedis(db=config.getint('REDIS', 'db', fallback=1), decode_responses=True)
         self.device_info = None
         self.active = False
         self.online = False
@@ -44,13 +46,14 @@ class IEC104Device(asyncio.Protocol):
 
     def connection_lost(self, exc):
         if exc is None:
-            logger.debug('device[%s] closed.', self.device_id)
+            logger.info('device[%s] closed.', self.device_id)
         else:
-            logger.error('device[%s] connection_lost.', self.device_id)
+            logger.info('device[%s] connection_lost.', self.device_id)
         self.stop_timer(IECParam.T0)
         self.stop_timer(IECParam.T1)
         self.stop_timer(IECParam.T2)
         self.stop_timer(IECParam.T3)
+        self.frame_list[self.device_id].clear()
 
     def inc_ssn(self):
         self.ssn = self.ssn + 1 if self.ssn < 32767 else 0
@@ -99,19 +102,25 @@ class IEC104Device(asyncio.Protocol):
                              (self.ssn, frame.APCI2), (self.rsn, frame.APCI1), (self.k, self.w))
                 # S or I, check rsn, ssn first
                 bad_frame = False
-                if self.ssn < frame.APCI2:
-                    bad_frame = True
-                else:
-                    self.k = self.ssn - frame.APCI2
-                if frame.APCI1 != 'S':
-                    if self.rsn != frame.APCI1:
+                if frame.APCI1 == 'S':  # S Frame
+                    if self.ssn < frame.APCI2 and frame.APCI2 - self.ssn < 20000:
                         bad_frame = True
                     else:
-                        self.rsn += 1
-                        self.w += 1
+                        self.k = self.ssn - frame.APCI2 if self.ssn >= frame.APCI2 else 32768 + self.ssn - frame.APCI2
+                else:  # I Frame
+                    if self.ssn < frame.APCI2 and frame.APCI2 - self.ssn < 20000:
+                        bad_frame = True
+                    else:
+                        self.k = self.ssn - frame.APCI2 if self.ssn >= frame.APCI2 else 32768 + self.ssn - frame.APCI2
+                        if self.rsn != frame.APCI1:
+                            bad_frame = True
+                        else:
+                            self.inc_rsn()
+                            self.w += 1
                 if bad_frame:
-                    logger.error(
-                        "device[%s] I_frame mismatch! try reconnect..", self.device_id)
+                    logger.error("device[%s] I_frame mismatch! self.ssn,frame.rsn=%s, self.rsn, "
+                                 "frame.ssn=%s, k,w=%s", self.device_id, (self.ssn, frame.APCI2),
+                                 (self.rsn, frame.APCI1), (self.k, self.w))
                 elif frame.APCI1 != 'S':
                     self.io_loop.create_task(self.handle_i(frame))
         except Exception as e:
@@ -163,7 +172,8 @@ class IEC104Device(asyncio.Protocol):
                 send_data = frame
                 send_data.ASDU.Cause = Cause.actcon
                 self.send_frame(send_data)
-                self.begin_C_IC_NA_1()
+                logger.debug('device[%s] send task data begin, ssn=%s', self.device_id, self.ssn)
+                self.generate_call_all_data()
                 send_data.ASDU.Cause = Cause.actterm
                 self.send_frame(send_data)
             # 电能脉冲召唤命令
@@ -171,19 +181,27 @@ class IEC104Device(asyncio.Protocol):
                 send_data = frame
                 send_data.ASDU.Cause = Cause.actcon
                 self.send_frame(send_data)
-                self.begin_C_CI_NA_1()
+                self.generate_call_power_data()
                 send_data.ASDU.Cause = Cause.actterm
                 self.send_frame(send_data)
+                logger.debug('device[%s] send task data end, ssn=%s', self.device_id, self.ssn)
             # 读命令
             elif frame.ASDU.TYP == TYP.C_RD_NA_1:
                 if frame.ASDU.Cause == Cause.act:
-                    term_item_dict = self.redis.hgetall('HS:MAPPING:IEC104:{}:{}'.format(self.device_id,
-                                                                                         frame.ASDU.data[0].Address))
+                    term_item_dict = self.redis.hgetall('HS:MAPPING:IEC104:{}:{}'.format(
+                            self.device_id, frame.ASDU.data[0].Address))
+                    value = None
+                    last_time = self.redis.lindex('LST:DATA_TIME:{}:{}:{}'.format(
+                        self.device_id, term_item_dict['term_id'], term_item_dict['item_id']), -1)
+                    if last_time:
+                        value = self.redis.hget('HS:DATA:{}:{}:{}'.format(
+                                self.device_id, term_item_dict['term_id'], term_item_dict['item_id']), last_time)
                     logger.debug('term_item_dict=%s', term_item_dict)
                     typ = TYP(int(term_item_dict['code_type']))
+                    address = int(term_item_dict['protocol_code'])
                     send_frame = iec_104.init_frame(self.ssn, self.rsn, typ, Cause.req)
-                    send_frame.ASDU.data[0].Value = 123
-                    send_frame.ASDU.data[0].Address = int(term_item_dict['protocol_code'])
+                    send_frame.ASDU.data[0].Value = str_to_number(value) or random.uniform(100, 200)
+                    send_frame.ASDU.data[0].Address = address
                     logger.debug('C_RD_NA_1, send_frame=%s', send_frame)
                     self.send_frame(send_frame)
             # TODO: 完成尚未实现的I帧
@@ -270,30 +288,46 @@ class IEC104Device(asyncio.Protocol):
     def save_frame(self, frame, send=True):
         IEC104Device.frame_list[self.device_id].append(('send' if send else 'recv', frame))
 
-    def begin_C_IC_NA_1(self):
-        typ_list = list(range(39))
-        typ_list = typ_list[1:17] + typ_list[20:22] + typ_list[30:]
-        logger.debug('C_IC_NA_1 num=%s', len(typ_list))
-        for typ in typ_list:
-            frame = iec_104.init_frame(self.ssn, self.rsn, TYP(typ), Cause.introgen)
-            frame.ASDU.StartAddress = typ
-            frame.ASDU.data[0].Address = typ
-            frame.ASDU.data[0].Value = typ
-            if hasattr(frame.ASDU.data[0], 'CP56Time2a'):
-                frame.ASDU.data[0].CP56Time2a = datetime.datetime.now()
-            if hasattr(frame.ASDU.data[0], 'CP24Time2a'):
-                frame.ASDU.data[0].CP24Time2a = datetime.datetime.now()
-            self.send_frame(frame)
+    def generate_call_all_data(self):
+        try:
+            cursor = None
+            all_keys = set()
+            while cursor != 0:
+                res = self.redis.scan(cursor or b'0', match='HS:MAPPING:IEC104:{}:*'.format(self.device_id))
+                cursor, keys = res
+                all_keys.update(keys)
+            for key in all_keys:
+                term_item_dict = self.redis.hgetall(key)
+                logger.debug('device[%s] generate_call_all_data %s=%s', self.device_id, key, term_item_dict)
+                typ = int(term_item_dict['code_type'])
+                if typ > TYP.M_EP_TD_1.value:
+                    typ = TYP.M_ME_TC_1.value
+                address = int(term_item_dict['protocol_code'])
+                up_limit = term_item_dict.get('up_limit')
+                down_limit = term_item_dict.get('down_limit')
+                value = None
+                if up_limit:
+                    value = random.uniform(float(down_limit), float(up_limit))
+                frame = iec_104.init_frame(self.ssn, self.rsn, TYP(typ), Cause.introgen)
+                frame.ASDU.StartAddress = address
+                frame.ASDU.data[0].Address = address
+                frame.ASDU.data[0].Value = value or random.uniform(100, 200)
+                if hasattr(frame.ASDU.data[0], 'CP56Time2a'):
+                    frame.ASDU.data[0].CP56Time2a = datetime.datetime.now()
+                if hasattr(frame.ASDU.data[0], 'CP24Time2a'):
+                    frame.ASDU.data[0].CP24Time2a = datetime.datetime.now()
+                self.send_frame(frame)
+        except Exception as e:
+            logger.error("device[%s] generate_call_all_data failed: %s", self.device_id, repr(e), exc_info=True)
 
-    def begin_C_CI_NA_1(self):
-        for addr in range(10):
-            frame = iec_104.init_frame(self.ssn, self.rsn, TYP.M_IT_NA_1, Cause.introgen)
-            frame.ASDU.data[0].Address = addr
-            frame.ASDU.data[0].Value = addr
-            self.send_frame(frame)
+    def generate_call_power_data(self):
+        pass
 
-if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
+
+def run_server():
+    print('mock device running.')
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     server_list = []
     for idx in range(5):
         server_list.append(
@@ -302,5 +336,14 @@ if __name__ == '__main__':
         loop.run_forever()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        logger.error('run failed: %s', repr(e), exc_info=True)
     finally:
+        for server in server_list:
+            server.close()
+            loop.run_until_complete(server.wait_closed())
         loop.close()
+    print('mock device stopped.')
+
+if __name__ == '__main__':
+    run_server()

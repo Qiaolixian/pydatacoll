@@ -1,42 +1,59 @@
-from utils import logger as my_logger
-import redis
 import asyncio
-import aioredis
 import datetime
-import ujson as json
+
+import aioredis
+import functools
+import redis
+
+try:
+    import ujson as json
+except ImportError:
+    import json
 from abc import ABCMeta, abstractmethod
 
-logger = my_logger.getLogger('BaseDevice')
+from pydatacoll.utils import logger as my_logger
+from pydatacoll.utils.read_config import *
+
+logger = my_logger.get_logger('BaseDevice')
 
 
 class BaseDevice(object, metaclass=ABCMeta):
-    def __init__(self, io_loop: asyncio.AbstractEventLoop, redis_pool: aioredis.RedisPool, device_info: dict):
+    def __init__(self, device_info: dict, io_loop: asyncio.AbstractEventLoop,
+                 redis_pool: aioredis.RedisPool):
         self.connected = False
         self.device_info = device_info
         self.device_id = self.device_info['id']
-        self.io_loop = io_loop
-        self.redis_pool = redis_pool
-        self.redis_client = redis.StrictRedis(db=1, decode_responses=True)
+        self.io_loop = io_loop or asyncio.get_event_loop()
+        self.redis_pool = redis_pool or self.io_loop.run_until_complete(
+                functools.partial(aioredis.create_pool, (config.get('REDIS', 'host', fallback='localhost'),
+                                                         config.getint('REDIS', 'port', fallback=6379)),
+                                  db=config.getint('REDIS', 'db', fallback=1),
+                                  minsize=config.getint('REDIS', 'minsize', fallback=5),
+                                  maxsize=config.getint('REDIS', 'maxsize', fallback=10),
+                                  encoding=config.get('REDIS', 'encoding', fallback='utf-8'))())
+        self.redis_client = redis.StrictRedis(db=config.getint('REDIS', 'db', fallback=1), decode_responses=True)
 
-    async def save_frame(self, frame, send=True):
+    async def save_frame(self, frame, send=True, save_time=datetime.datetime.now()):
         try:
             with (await self.redis_pool) as redis_client:
-                await redis_client.rpush("LST:FRAME:{}".format(self.device_id),
-                                         '{time},{type},{frame}'.format(
-                                             time=datetime.datetime.now().isoformat(sep=' '),
-                                             type="send" if send is True else "recv",
-                                             frame=frame.hex()))
+                await redis_client.rpush(
+                        "LST:FRAME:{}".format(self.device_id),
+                        '{time},{type},{frame}'.format(
+                                time=save_time.isoformat(),
+                                type="send" if send is True else "recv", frame=frame.hex()))
         except Exception as e:
             logger.error("device[%s] save_frame failed: %s", self.device_id, repr(e))
 
     # 召测
-    async def call_data(self, term_id, item_id):
+    async def call_data(self, call_dict):
         try:
             if not self.connected:
                 raise Exception('device not connected!')
+            term_id = call_dict['term_id']
+            item_id = call_dict['item_id']
             with (await self.redis_pool) as redis_client:
-                term_item = await redis_client.hgetall(
-                    'HS:TERM_ITEM:{term_id}:{item_id}'.format(term_id=term_id, item_id=item_id))
+                term_item = await redis_client.hgetall('HS:TERM_ITEM:{term_id}:{item_id}'.format(
+                        term_id=term_id, item_id=item_id))
                 logger.debug('device[%s] call_data, term_item=%s', self.device_id, term_item)
                 if not term_item:
                     logger.error('device[%s] HS:TERM_ITEM:{%s}:{%s} not found!', self.device_id, term_id, item_id)
@@ -47,13 +64,16 @@ class BaseDevice(object, metaclass=ABCMeta):
             logger.error('device[%s] call_data failed: %s', self.device_id, repr(e))
 
     # 控制
-    async def ctrl_data(self, term_id, item_id, value):
+    async def ctrl_data(self, ctrl_dict):
         try:
             if not self.connected:
                 raise Exception('device not connected!')
+            term_id = ctrl_dict['term_id']
+            item_id = ctrl_dict['item_id']
+            value = ctrl_dict['value']
             with (await self.redis_pool) as redis_client:
-                term_item = await redis_client.hgetall(
-                    'HS:TERM_ITEM:{term_id}:{item_id}'.format(term_id=term_id, item_id=item_id))
+                term_item = await redis_client.hgetall('HS:TERM_ITEM:{term_id}:{item_id}'.format(
+                                term_id=term_id, item_id=item_id))
                 logger.debug('device[%s] ctrl_data, term_item=%s, value=%s', self.device_id, term_item, value)
                 if not term_item:
                     logger.error('device[%s] HS:TERM_ITEM:{%s}:{%s} not found!', self.device_id, term_id, item_id)
@@ -84,40 +104,30 @@ class BaseDevice(object, metaclass=ABCMeta):
         try:
             with (await self.redis_pool) as redis_client:
                 for data_time, protocol_code, data_value in data_pairs:
-                    map_key = 'HS:MAPPING:{}:{}:{}'.format(
-                        self.device_info['protocol'].upper(), self.device_id, protocol_code)
+                    map_key = 'HS:MAPPING:{}:{}:{}'.format(self.device_info['protocol'].upper(),
+                                                           self.device_id, protocol_code)
                     term_item = await redis_client.hgetall(map_key)
                     if not term_item:
                         logger.debug("DEVICE[%s] precess_data: can't found term_item, key=%s", self.device_id, map_key)
                         continue
                     if 'coefficient' in term_item and 'base_val' in term_item:
                         data_value = data_value * float(term_item['coefficient']) + float(term_item['base_val'])
-                    json_data = json.dumps((data_time.isoformat(sep=' '), data_value))
+                    json_data = json.dumps({
+                        'device_id': self.device_id, 'term_id': term_item['term_id'], 'item_id': term_item['item_id'],
+                        'time': data_time.isoformat(), 'value': data_value,
+                    })
                     pub_channel = 'CHANNEL:DEVICE_{}:{}:{}:{}'.format(
-                        method.upper(), self.device_id, term_item['term_id'], term_item['item_id'])
+                            method.upper(), self.device_id, term_item['term_id'], term_item['item_id'])
+                    if method == 'data':
+                        data_key = "{}:{}:{}".format(
+                                self.device_id, term_item['term_id'], term_item['item_id'])
+                        time_str = data_time.isoformat()
+                        await redis_client.hset("HS:DATA:{}".format(data_key), time_str, data_value)
+                        await redis_client.rpush("LST:DATA_TIME:{}".format(data_key), time_str)
                     rst = await redis_client.publish(pub_channel, json_data)
                     logger.debug('pub to %s, val=%s, rst=%s', pub_channel, json_data, rst)
-                    if method == 'data':
-                        data_key = "LST:DATA:{}:{}:{}".format(self.device_id, term_item['term_id'], term_item['item_id'])
-                        await redis_client.rpush(data_key, json_data)
-                        # if check_result != 'OK':
-                        #     warn_msg = json.dumps(
-                        #         {'warn_msg': check_result, 'device_id': self.device_id, 'term_id': term_item['term_id'],
-                        #          'item_id': term_item['item_id'], 'time': data_time, 'value': data_value})
-                        #     await redis_client.publish('CHANNEL:WARNING', warn_msg)
         except Exception as e:
             logger.exception(e)
-
-    @abstractmethod
-    def fresh_task(self, term_id, item_id, delete=False):
-        pass
-
-    @abstractmethod
-    async def run_task(self):
-        """
-        :return:
-        """
-        pass
 
     @abstractmethod
     async def send_frame(self, frame, check=True):
@@ -126,6 +136,10 @@ class BaseDevice(object, metaclass=ABCMeta):
         :param check: directly send or save to send buffer
         :return: None
         """
+        pass
+
+    @abstractmethod
+    def fresh_task(self, term_dict, term_item_dict, delete=False):
         pass
 
     @abstractmethod
@@ -147,5 +161,4 @@ class BaseDevice(object, metaclass=ABCMeta):
 
     @abstractmethod
     def disconnect(self, reconnect=False):
-        # a = redis.StrictRedis(host='pub-redis-10152.dal-05.1.sl.garantiadata.com', port=10152, password='jeffchen')
         pass

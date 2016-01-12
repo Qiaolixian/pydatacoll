@@ -1,0 +1,3 @@
+[run]
+source = pydatacoll
+omit = pydatacoll/utils/asteval/*, pydatacoll/resources/*
