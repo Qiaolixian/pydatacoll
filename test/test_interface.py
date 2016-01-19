@@ -2,7 +2,6 @@ import asyncio
 import aiohttp
 import aioredis
 import asynctest
-import functools
 import redis
 try:
     import ujson as json
@@ -69,12 +68,7 @@ class InterfaceTest(asynctest.TestCase):
         self.redis_client = redis.StrictRedis(db=1, decode_responses=True)
         mock_data.generate()
         self.server_list = list()
-        for device in mock_data.device_list:
-            if 'port' not in device:
-                continue
-            self.server_list.append(
-                self.loop.run_until_complete(
-                        self.loop.create_server(iec104device.IEC104Device, '127.0.0.1', device['port'])))
+        self.server_list = iec104device.create_servers(self.loop)
         self.api_server = api_server.APIServer(io_loop=self.loop, port=8080)
 
     def tearDown(self):
@@ -148,7 +142,7 @@ class InterfaceTest(asynctest.TestCase):
             rst = self.redis_client.sismember('SET:FORMULA', 5)
             self.assertFalse(rst)
 
-        formula_check = {'formula': 'p1[-1]+10', 'p1': 'HS:DATA:1:10:1000'}
+        formula_check = {'formula': 'p1[-1]+10', 'p1': '1:10:1000'}
         async with aiohttp.post('http://127.0.0.1:8080/api/v1/formula_check', data=json.dumps(formula_check)) as r:
             self.assertEqual(r.status, 200)
             rst = await r.text()
@@ -163,11 +157,23 @@ class InterfaceTest(asynctest.TestCase):
 name 'p2' is not defined
 """)
 
+        formula_check['p1'] = '123:45:6'
+        async with aiohttp.post('http://127.0.0.1:8080/api/v1/formula_check', data=json.dumps(formula_check)) as r:
+            self.assertEqual(r.status, 200)
+            rst = await r.text()
+            self.assertEqual(rst, "parameter not found: p1=123:45:6")
+
+        formulas = [1]
+        async with aiohttp.post('http://127.0.0.1:8080/api/v2/formulas/del', data=json.dumps(formulas)) as r:
+            self.assertEqual(r.status, 200)
+            rst = self.redis_client.smembers('SET:FORMULA')
+            self.assertEqual(len(rst), 0)
+
     async def test_device_CRUD(self):
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/devices') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
-            self.assertSequenceEqual(rst, ['1', '2', '3'])
+            self.assertSetEqual(set(rst), {'1', '2', '3'})
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/devices/1') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
@@ -212,11 +218,17 @@ name 'p2' is not defined
             rst = self.redis_client.sismember('SET:DEVICE', 5)
             self.assertFalse(rst)
 
+        devices = [1, 2, 3]
+        async with aiohttp.post('http://127.0.0.1:8080/api/v2/devices/del', data=json.dumps(devices)) as r:
+            self.assertEqual(r.status, 200)
+            rst = self.redis_client.smembers('SET:DEVICE')
+            self.assertEqual(len(rst), 0)
+
     async def test_term_CRUD(self):
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/terms') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
-            self.assertSequenceEqual(rst, ['10', '20', '30', '40'])
+            self.assertSetEqual(set(rst), {'10', '20', '30', '40'})
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/terms/10') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
@@ -228,7 +240,7 @@ name 'p2' is not defined
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/devices/1/terms') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
-            self.assertSequenceEqual(rst, ['10', '20'])
+            self.assertSetEqual(set(rst), {'10', '20'})
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/devices/99/terms') as r:
             self.assertEqual(r.status, 404)
             rst = await r.text()
@@ -276,11 +288,17 @@ name 'p2' is not defined
             rst = self.redis_client.sismember('SET:TERM', 50)
             self.assertFalse(rst)
 
+        terms = [10, 20, 30, 40]
+        async with aiohttp.post('http://127.0.0.1:8080/api/v2/terms/del', data=json.dumps(terms)) as r:
+            self.assertEqual(r.status, 200)
+            rst = self.redis_client.smembers('SET:TERM')
+            self.assertEqual(len(rst), 0)
+
     async def test_item_CRUD(self):
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/items') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
-            self.assertSequenceEqual(rst, ['1000', '2000'])
+            self.assertSetEqual(set(rst), {'1000', '2000'})
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/items/1000') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
@@ -292,7 +310,7 @@ name 'p2' is not defined
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/terms/10/items') as r:
             self.assertEqual(r.status, 200)
             rst = await r.json()
-            self.assertSequenceEqual(rst, ['1000', '2000'])
+            self.assertSetEqual(set(rst), {'1000', '2000'})
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/terms/99/items') as r:
             self.assertEqual(r.status, 404)
             rst = await r.text()
@@ -332,6 +350,12 @@ name 'p2' is not defined
             self.assertFalse(rst)
             rst = self.redis_client.sismember('SET:ITEM', 4000)
             self.assertFalse(rst)
+
+        items = [1000, 2000]
+        async with aiohttp.post('http://127.0.0.1:8080/api/v2/items/del', data=json.dumps(items)) as r:
+            self.assertEqual(r.status, 200)
+            rst = self.redis_client.smembers('SET:ITEM')
+            self.assertEqual(len(rst), 0)
 
     async def test_get_data(self):
         async with aiohttp.get('http://127.0.0.1:8080/api/v1/devices/1/terms/10/items/1000/datas') as r:
@@ -409,6 +433,12 @@ name 'p2' is not defined
             self.assertFalse(rst)
         del mock_data.test_term_item['device_id']
 
+        async with aiohttp.post('http://127.0.0.1:8080/api/v2/term_items/del',
+                                  data=json.dumps(mock_data.term_item_list)) as r:
+            self.assertEqual(r.status, 200)
+            rst = list(self.redis_client.scan_iter('HS:TERM_ITEMS:*'))
+            self.assertEqual(len(rst), 0)
+
     async def test_device_call(self):
         call_dict = {'device_id': '1', 'term_id': '10', 'item_id': 1000}
         async with aiohttp.post('http://127.0.0.1:8080/api/v1/device_call', data=json.dumps(call_dict)) as r:
@@ -422,3 +452,10 @@ name 'p2' is not defined
             self.assertEqual(r.status, 200)
             rst = await r.json()
             self.assertAlmostEqual(rst['value'], 123.4, delta=0.0001)
+
+    async def test_sql_check(self):
+        async with aiohttp.post('http://127.0.0.1:8080/api/v1/sql_check',
+                                data=json.dumps(mock_data.term10_item1000)) as r:
+            self.assertEqual(r.status, 200)
+            rst = await r.text()
+            self.assertEqual(rst, 'not found sql to check')
